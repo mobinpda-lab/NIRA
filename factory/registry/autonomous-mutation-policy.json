@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "authority": "NIRA canonical GitHub issue queue + lease + worker + promotion",
   "direct_main_writes_allowed": false,
   "autonomous_controller": {
@@ -11,6 +11,21 @@
     "may_close_completed_tasks": true,
     "may_write_repository_contents": false,
     "may_merge_pull_requests": false
+  },
+  "global_reconcile_controller": {
+    "workflow": ".github/workflows/nira-global-reconcile.yml",
+    "cadence": "*/5 * * * *",
+    "decision_model": ["WAIT", "RECOVER", "CONTINUE"],
+    "priority_order": ["PRODUCT", "RELEASE_BLOCKER", "RECOVERY", "FACTORY_IMPROVEMENT"],
+    "queue_is_single_dispatch_authority": true,
+    "may_wake_canonical_intake": true,
+    "may_wake_queue_scheduler": true,
+    "may_wake_bounded_recovery_probe": true,
+    "may_dispatch_workers_directly": false,
+    "may_write_repository_contents": false,
+    "may_merge_pull_requests": false,
+    "requires_exact_main_race_check": true,
+    "requires_reconstructable_snapshot_artifact": true
   },
   "mutation_boundary": {
     "mode": "PR_ONLY",
@@ -26,6 +41,7 @@
     ".github/workflows/nira-lease.yml",
     ".github/workflows/nira-cross-repo-worker.yml",
     ".github/workflows/nira-provider-capacity-probe.yml",
+    ".github/workflows/nira-global-reconcile.yml",
     ".github/workflows/factory-conformance.yml",
     ".github/workflows/nira-security-gate.yml",
     "factory/runtime/provider_router.js",
@@ -49,6 +65,8 @@
     "provider_capacity_restoration_requires_probe_evidence": true,
     "provider_capacity_restoration_requeues_only_blocked_self_completion": true,
     "multi_provider_failover_is_bounded": true,
-    "openai_is_optional": true
+    "openai_is_optional": true,
+    "automatic_merge_enabled": false,
+    "global_reconcile_requires_exact_main": true
   }
 }

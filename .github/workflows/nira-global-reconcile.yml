@@ -1,0 +1,252 @@
+name: NIRA Global Reconcile
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  actions: write
+
+concurrency:
+  group: nira-global-reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Collect reconstructable GitHub snapshot
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const labelSet = issue => new Set((issue.labels || []).map(x => typeof x === 'string' ? x : x.name));
+            const hasAny = (labels, names) => names.some(name => labels.has(name));
+
+            const mainRef = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const mainSha = mainRef.data.object.sha;
+
+            const rows = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', per_page: 100
+            });
+            const issues = rows.filter(row => !row.pull_request);
+            const openPrs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', base: 'main', per_page: 100
+            });
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner, repo, branch: 'main', per_page: 100
+            });
+
+            const canonicalNames = new Set([
+              'NIRA Intake Queue',
+              'NIRA Queue Scheduler',
+              'NIRA Lease',
+              'NIRA Cross-Repository Worker',
+              'NIRA Provider Capacity Probe',
+              'NIRA Autonomous Self Completion',
+              'NIRA Production Orchestrator'
+            ]);
+            const activeCanonicalRuns = runs.filter(run =>
+              canonicalNames.has(run.name) && ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status)
+            );
+
+            const activeWorkers = issues.filter(issue => labelSet(issue).has('factory:in-progress')).length;
+            const activeLeases = issues.filter(issue => labelSet(issue).has('factory:leased')).length;
+            const openCandidatePrs = openPrs.filter(pr => String(pr.head?.ref || '').startsWith('nira/')).length;
+
+            const securityHolds = [];
+            const humanHolds = [];
+            for (const issue of issues) {
+              const labels = labelSet(issue);
+              if (hasAny(labels, ['security:hold', 'security-hold'])) securityHolds.push(`#${issue.number}`);
+              if (hasAny(labels, ['human-gate', 'human:gate', 'factory:escalated'])) humanHolds.push(`#${issue.number}`);
+            }
+            for (const pr of openPrs) {
+              const labels = new Set((pr.labels || []).map(x => typeof x === 'string' ? x : x.name));
+              if (labels.has('do-not-merge')) securityHolds.push(`pr-${pr.number}:do-not-merge`);
+            }
+
+            const eligible = issues.filter(issue => {
+              const labels = labelSet(issue);
+              const active = hasAny(labels, ['factory:leased', 'factory:in-progress', 'factory:blocked', 'factory:escalated', 'factory:completed']);
+              return !active && hasAny(labels, ['factory:ready', 'factory:queued']);
+            });
+            const productTasks = eligible
+              .filter(issue => {
+                const labels = labelSet(issue);
+                return !labels.has('priority:automation') && hasAny(labels, ['priority:product', 'priority:core']);
+              })
+              .map(issue => issue.number);
+            const releaseBlockers = eligible
+              .filter(issue => labelSet(issue).has('priority:release-blocker'))
+              .map(issue => issue.number);
+            const factoryImprovements = eligible
+              .filter(issue => labelSet(issue).has('priority:automation'))
+              .map(issue => issue.number);
+
+            let recoveryIssue = null;
+            let recoveryAttempts = 0;
+            const retryableFailures = [];
+            const blocked = issues.filter(issue => labelSet(issue).has('factory:blocked'));
+            for (const issue of blocked.sort((a, b) => a.number - b.number)) {
+              if (!String(issue.body || '').includes('NIRA_SELF_COMPLETION_TASK: true')) continue;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: issue.number, per_page: 100
+              });
+              const text = comments.map(comment => String(comment.body || '')).join('\n');
+              const providerRecovery = text.includes('NIRA_PROVIDER_CAPACITY=EXHAUSTED') || text.includes('NIRA_PROVIDER_PRESSURE=TRANSIENT');
+              if (!providerRecovery) continue;
+              recoveryIssue = issue.number;
+              recoveryAttempts = comments.filter(comment => String(comment.body || '').includes('NIRA_GLOBAL_RECOVERY_ATTEMPT=')).length;
+              retryableFailures.push(`issue-${issue.number}:provider-pressure`);
+              break;
+            }
+
+            const snapshot = {
+              main_sha: mainSha,
+              active_workers: activeWorkers,
+              active_leases: activeLeases,
+              active_canonical_runs: activeCanonicalRuns.length,
+              open_candidate_prs: openCandidatePrs,
+              product_tasks: productTasks,
+              release_blockers: releaseBlockers,
+              factory_improvements: factoryImprovements,
+              retryable_failures: retryableFailures,
+              recovery_issue: recoveryIssue,
+              recovery_attempts: recoveryAttempts,
+              recovery_budget: 2,
+              security_holds: securityHolds,
+              human_holds: humanHolds
+            };
+            fs.writeFileSync('nira-global-snapshot.json', JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
+            core.notice(`NIRA_GLOBAL_SNAPSHOT main=${mainSha} workers=${activeWorkers} leases=${activeLeases} active_runs=${activeCanonicalRuns.length} prs=${openCandidatePrs}`);
+
+      - name: Decide next safe action
+        run: |
+          python -m factory.runtime.global_reconcile nira-global-snapshot.json > nira-global-decision.json
+          cat nira-global-decision.json
+
+      - name: Reconcile through canonical queue only
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const snapshot = JSON.parse(fs.readFileSync('nira-global-snapshot.json', 'utf8'));
+            const decision = JSON.parse(fs.readFileSync('nira-global-decision.json', 'utf8'));
+            core.notice(`NIRA_GLOBAL_RECONCILE=${decision.decision} category=${decision.category} issue=${decision.issue_number || 'none'} reason=${decision.reason}`);
+
+            if (decision.decision === 'WAIT') {
+              if (decision.escalate && decision.issue_number) {
+                const issueNumber = Number(decision.issue_number);
+                await github.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: ['factory:escalated'] });
+                const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: issueNumber, per_page: 100 });
+                const marker = '<!-- nira-global-recovery-escalated -->';
+                if (!comments.some(comment => String(comment.body || '').includes(marker))) {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issueNumber,
+                    body: `${marker}\nNIRA_GLOBAL_RECOVERY=ESCALATED\nATTEMPTS=${snapshot.recovery_attempts}\nBUDGET=${snapshot.recovery_budget}\nACTION=HUMAN_GATE`
+                  });
+                }
+              }
+              return;
+            }
+
+            const currentRef = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            if (currentRef.data.object.sha !== snapshot.main_sha) {
+              core.notice(`NIRA_GLOBAL_RECONCILE=WAIT reason=main-drift snapshot=${snapshot.main_sha} current=${currentRef.data.object.sha}`);
+              return;
+            }
+
+            const activeRuns = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner, repo, branch: 'main', per_page: 100
+            });
+            const canonicalNames = new Set([
+              'NIRA Intake Queue', 'NIRA Queue Scheduler', 'NIRA Lease',
+              'NIRA Cross-Repository Worker', 'NIRA Provider Capacity Probe',
+              'NIRA Autonomous Self Completion', 'NIRA Production Orchestrator'
+            ]);
+            if (activeRuns.some(run => canonicalNames.has(run.name) && ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status))) {
+              core.notice('NIRA_GLOBAL_RECONCILE=WAIT reason=race-active-canonical-run');
+              return;
+            }
+
+            const issueNumber = Number(decision.issue_number || 0);
+            if (!issueNumber) {
+              core.notice('NIRA_GLOBAL_RECONCILE=WAIT reason=no-selected-issue');
+              return;
+            }
+            const issueResponse = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
+            const issue = issueResponse.data;
+            const labels = new Set((issue.labels || []).map(x => typeof x === 'string' ? x : x.name));
+            if (['factory:leased', 'factory:in-progress', 'factory:escalated'].some(name => labels.has(name))) {
+              core.notice('NIRA_GLOBAL_RECONCILE=WAIT reason=selected-issue-became-active');
+              return;
+            }
+
+            const openPrs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', base: 'main', per_page: 100 });
+            const relatedPr = openPrs.find(pr =>
+              String(pr.body || '').includes(`Issue: #${issueNumber}`) ||
+              String(pr.body || '').includes(`Refs #${issueNumber}`)
+            );
+            if (relatedPr) {
+              core.notice(`NIRA_GLOBAL_RECONCILE=WAIT reason=related-pr-open pr=${relatedPr.number}`);
+              return;
+            }
+
+            if (decision.decision === 'RECOVER') {
+              if (!labels.has('factory:blocked')) {
+                core.notice('NIRA_GLOBAL_RECONCILE=WAIT reason=recovery-target-not-blocked');
+                return;
+              }
+              const nextAttempt = Number(snapshot.recovery_attempts || 0) + 1;
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issueNumber,
+                body: `NIRA_GLOBAL_RECOVERY_ATTEMPT=${nextAttempt}\nRECOVERY_KIND=PROVIDER_CAPACITY\nACTION=WAKE_BOUNDED_PROBE\nEXACT_MAIN=${snapshot.main_sha}`
+              });
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo, workflow_id: 'nira-provider-capacity-probe.yml', ref: 'main'
+              });
+              core.notice(`NIRA_GLOBAL_RECONCILE=RECOVER issue=${issueNumber} attempt=${nextAttempt}`);
+              return;
+            }
+
+            if (decision.decision === 'CONTINUE') {
+              if (labels.has('factory:queued')) {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo, workflow_id: 'nira-queue-scheduler.yml', ref: 'main'
+                });
+                core.notice(`NIRA_GLOBAL_RECONCILE=CONTINUE issue=${issueNumber} action=WAKE_QUEUE_SCHEDULER`);
+                return;
+              }
+              if (labels.has('factory:ready')) {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo, workflow_id: 'nira-intake-queue.yml', ref: 'main', inputs: { issue_number: String(issueNumber) }
+                });
+                core.notice(`NIRA_GLOBAL_RECONCILE=CONTINUE issue=${issueNumber} action=WAKE_CANONICAL_INTAKE`);
+                return;
+              }
+              core.notice('NIRA_GLOBAL_RECONCILE=WAIT reason=selected-issue-not-ready-or-queued');
+            }
+
+      - name: Upload global reconcile evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: nira-global-reconcile-${{ github.run_id }}
+          path: |
+            nira-global-snapshot.json
+            nira-global-decision.json
+          if-no-files-found: error

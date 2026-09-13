@@ -17,7 +17,7 @@ permissions:
   contents: write
   pull-requests: write
   actions: write
-  issues: read
+  issues: write
 
 concurrency:
   group: nira-production-promotion
@@ -63,6 +63,7 @@ jobs:
           test -f "$policy" || { echo "BLOCK registry policy missing"; exit 1; }
 
           enabled=$(jq -r '.promotion.enabled' "$policy")
+          auto_merge=$(jq -r '.promotion.automatic_merge_enabled // false' "$policy")
           required_label=$(jq -r '.promotion.required_label' "$policy")
           head_prefix=$(jq -r '.promotion.head_branch_prefix' "$policy")
           max_candidates=$(jq -r '.promotion.max_candidates_per_cycle' "$policy")
@@ -75,6 +76,7 @@ jobs:
           [[ "$enabled" == "true" ]] || { echo "PROMOTION_DISABLED"; exit 0; }
           [[ "${#required_workflows[@]}" -gt 0 ]] || { echo "BLOCK invalid registry policy: no required workflows"; exit 1; }
           [[ "$required_label" != "null" && "$head_prefix" != "null" ]] || { echo "BLOCK invalid registry policy"; exit 1; }
+          echo "PROMOTION_POLICY automatic_merge_enabled=$auto_merge auto_ready=$auto_ready"
 
           prs=$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/$repo/pulls?state=open&base=main&per_page=100" | jq -s 'add')
           candidates=$(jq -c --arg label "$required_label" --arg prefix "$head_prefix" '[.[] | select(.mergeable != false and (.labels | map(.name) | index($label))) | select(.head.ref | startswith($prefix))] | sort_by(.number)' <<<"$prs")
@@ -144,6 +146,19 @@ jobs:
             fi
 
             [[ "$(jq -r '.mergeable' <<<"$pr_now")" != "false" ]] || { echo "BLOCK PR#$pr not mergeable"; continue; }
+
+            if [[ "$auto_merge" != "true" ]]; then
+              ready_marker="<!-- nira-human-merge-ready:$head -->"
+              comments=$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/$repo/issues/$pr/comments?per_page=100" | jq -s 'add')
+              already_noted=$(jq -r --arg marker "$ready_marker" '[.[] | select((.body // "") | contains($marker))] | length' <<<"$comments")
+              if [[ "$already_noted" -eq 0 ]]; then
+                body=$(printf '%s\nNIRA_PROMOTION=READY_FOR_HUMAN_MERGE\nPR=%s\nEXACT_HEAD=%s\nEXACT_MAIN=%s\nREQUIRED_WORKFLOWS=%s\nAUTOMATIC_MERGE=false' "$ready_marker" "$pr" "$head" "$current_main" "${required_workflows[*]}")
+                GH_TOKEN="$READ_TOKEN" gh api -X POST "repos/$repo/issues/$pr/comments" -f body="$body" >/dev/null
+              fi
+              echo "READY_FOR_HUMAN_MERGE pr=$pr head=$head main=$current_main"
+              break
+            fi
+
             payload=$(jq -n --arg sha "$head" --arg title "promote(nira): PR#$pr registry-authorized promotion" --arg message "NIRA registry-authorized promotion: exact HEAD/base, complete CI/E2E/conformance/security evidence, fail-closed validation." '{sha:$sha,merge_method:"squash",commit_title:$title,commit_message:$message}')
             response=$(curl --fail-with-body -sS -X PUT -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GH_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28" -H "Content-Type: application/json" "https://api.github.com/repos/$repo/pulls/$pr/merge" -d "$payload")
             [[ "$(jq -r '.merged // false' <<<"$response")" == "true" ]] || { echo "BLOCK PR#$pr merge API did not confirm merged=true"; continue; }
