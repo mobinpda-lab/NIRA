@@ -6,6 +6,11 @@ from factory.contracts.schema import ProjectContract, TaskState, Evidence, Obser
 from factory.gates.engine import Gate, GateResult, artifact_gate, evaluate, exact_head_gate
 from factory.recovery.policy import RecoveryPolicy
 from factory.runtime.state_machine import Lease, LeaseDecision, expiry_from, transition, validate_lease
+from factory.runtime.global_reconcile import (
+    GlobalReconciler,
+    ReconcileDecision,
+    ReconcileSnapshot,
+)
 
 
 def test_illegal_transition_is_fail_closed():
@@ -51,3 +56,14 @@ def test_recovery_is_bounded():
     assert policy.decision(2, True) == "REQUEUE"
     assert policy.decision(3, True) == "ESCALATE"
     assert policy.decision(1, False) == "ESCALATE"
+
+
+def test_stale_lease_without_execution_evidence_requires_recovery():
+    snapshot = ReconcileSnapshot(
+        main_sha="a" * 40,
+        active_leases=1,
+        stale_leases=1,
+        worker_execution_evidence=False,
+    )
+    result = GlobalReconciler().reconcile(snapshot)
+    assert result.decision == ReconcileDecision.RECOVER
