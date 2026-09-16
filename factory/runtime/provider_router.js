@@ -5,8 +5,8 @@ function textFromContent(content) {
   if (!Array.isArray(content)) return '';
   return content.map(part => {
     if (!part) return '';
-    if (typeof part === 'string') return part;
     if (typeof part.text === 'string') return part.text;
+    if (typeof part === 'string') return part;
     return '';
   }).filter(Boolean).join('\n');
 }
@@ -46,10 +46,7 @@ async function callGemini({ input, env, maxOutputTokens, expectJson, fetchFn }) 
     parts: [{ text: m.content }]
   }));
   if (!contents.length) contents.push({ role: 'user', parts: [{ text: 'Return the requested result.' }] });
-  const generationConfig = {
-    maxOutputTokens,
-    temperature: 0
-  };
+  const generationConfig = { maxOutputTokens, temperature: 0 };
   if (expectJson) generationConfig.responseMimeType = 'application/json';
   const body = { contents, generationConfig };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
@@ -57,10 +54,7 @@ async function callGemini({ input, env, maxOutputTokens, expectJson, fetchFn }) 
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     {
       method: 'POST',
-      headers: {
-        'x-goog-api-key': key,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     }
   );
@@ -74,20 +68,23 @@ async function callGemini({ input, env, maxOutputTokens, expectJson, fetchFn }) 
   const text = (result.candidates || [])
     .flatMap(candidate => candidate?.content?.parts || [])
     .map(part => typeof part?.text === 'string' ? part.text : '')
-    .filter(Boolean)
-    .join('\n');
+    .filter(Boolean).join('\n');
   if (!text) throw new Error('GEMINI_EMPTY_RESPONSE');
   return { output_text: text, provider: 'gemini', model };
 }
 
-async function callOpenRouter({ input, env, maxOutputTokens, fetchFn }) {
+async function callOpenRouter({ input, env, maxOutputTokens, expectJson, fetchFn }) {
   const key = env.OPENROUTER_API_KEY || '';
   if (!key) return null;
   const model = env.OPENROUTER_MODEL || 'openrouter/free';
-  const messages = normalizeMessages(input).map(message => ({
-    role: message.role,
-    content: message.content
-  }));
+  const messages = normalizeMessages(input).map(message => ({ role: message.role, content: message.content }));
+  const body = {
+    model,
+    messages,
+    max_tokens: maxOutputTokens,
+    temperature: 0
+  };
+  if (expectJson) body.response_format = { type: 'json_object' };
   const response = await fetchFn('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -96,12 +93,7 @@ async function callOpenRouter({ input, env, maxOutputTokens, fetchFn }) {
       'HTTP-Referer': 'https://github.com/mobinpda-lab/NIRA',
       'X-Title': 'NIRA Autonomous Software Factory'
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      max_tokens: maxOutputTokens,
-      temperature: 0
-    })
+    body: JSON.stringify(body)
   });
   if (!response.ok) {
     const detail = await response.text();
@@ -111,26 +103,21 @@ async function callOpenRouter({ input, env, maxOutputTokens, fetchFn }) {
   }
   const result = await response.json();
   const content = result?.choices?.[0]?.message?.content;
-  const text = typeof content === 'string'
-    ? content
-    : Array.isArray(content)
-      ? content.map(part => part?.text || '').filter(Boolean).join('\n')
-      : '';
+  const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map(part => part?.text || '').filter(Boolean).join('\n') : '';
   if (!text) throw new Error('OPENROUTER_EMPTY_RESPONSE');
   return { output_text: text, provider: 'openrouter', model: result.model || model };
 }
 
-async function callOpenAI({ input, env, maxOutputTokens, fetchFn }) {
+async function callOpenAI({ input, env, maxOutputTokens, expectJson, fetchFn }) {
   const key = env.OPENAI_API_KEY || '';
   if (!key) return null;
   const model = env.OPENAI_MODEL || 'gpt-5.6';
+  const body = { model, input, max_output_tokens: maxOutputTokens };
+  if (expectJson) body.text = { format: { type: 'json_object' } };
   const response = await fetchFn('https://api.openai.com/v1/responses', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${key}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ model, input, max_output_tokens: maxOutputTokens })
+    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
   if (!response.ok) {
     const detail = await response.text();
@@ -154,23 +141,12 @@ async function callOpenAI({ input, env, maxOutputTokens, fetchFn }) {
 }
 
 function providerMap() {
-  return {
-    gemini: callGemini,
-    openrouter: callOpenRouter,
-    openai: callOpenAI
-  };
+  return { gemini: callGemini, openrouter: callOpenRouter, openai: callOpenAI };
 }
 
 function configuredProviderNames(env) {
-  const order = String(env.NIRA_PROVIDER_ORDER || 'gemini,openrouter,openai')
-    .split(',')
-    .map(value => value.trim().toLowerCase())
-    .filter(Boolean);
-  const hasKey = {
-    gemini: Boolean(env.GEMINI_API_KEY),
-    openrouter: Boolean(env.OPENROUTER_API_KEY),
-    openai: Boolean(env.OPENAI_API_KEY)
-  };
+  const order = String(env.NIRA_PROVIDER_ORDER || 'gemini,openrouter,openai').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+  const hasKey = { gemini: Boolean(env.GEMINI_API_KEY), openrouter: Boolean(env.OPENROUTER_API_KEY), openai: Boolean(env.OPENAI_API_KEY) };
   return [...new Set(order)].filter(name => providerMap()[name] && hasKey[name]);
 }
 
@@ -227,32 +203,15 @@ async function routedResponse(input, options = {}) {
         if (core?.notice) core.notice(`NIRA_PROVIDER_ACTIVE=${provider} model=${result.model || ''}`);
         return result;
       } catch (error) {
-        const failure = error.niraProviderFailure || {
-          provider,
-          status: 0,
-          pressure: false,
-          exhausted: false,
-          retryAfter: 0,
-          detail: String(error.message || error).slice(0, 500)
-        };
+        const failure = error.niraProviderFailure || { provider, status: 0, pressure: false, exhausted: false, retryAfter: 0, detail: String(error.message || error).slice(0, 500) };
         attempts.push({ ...failure, providerAttempt });
         const retrySame = providerAttempt < maxProviderAttempts && retryableSameProviderFailure(failure);
         if (retrySame) {
-          if (core?.warning) {
-            core.warning(
-              `NIRA_PROVIDER_RETRY provider=${provider} attempt=${providerAttempt}/${maxProviderAttempts} ` +
-              `status=${failure.status} bounded=true`
-            );
-          }
+          core?.warning?.(`NIRA_PROVIDER_RETRY provider=${provider} attempt=${providerAttempt}/${maxProviderAttempts} status=${failure.status} bounded=true`);
           await delay(Math.min(1000 * providerAttempt, 2000));
           continue;
         }
-        if (core?.warning) {
-          core.warning(
-            `NIRA_PROVIDER_FAILOVER provider=${provider} status=${failure.status} ` +
-            `exhausted=${failure.exhausted} pressure=${failure.pressure}`
-          );
-        }
+        core?.warning?.(`NIRA_PROVIDER_FAILOVER provider=${provider} status=${failure.status} exhausted=${failure.exhausted} pressure=${failure.pressure}`);
         break;
       }
     }
@@ -269,11 +228,7 @@ async function routedResponse(input, options = {}) {
   setCoreOutput(core, 'provider_active', 'none');
   setCoreOutput(core, 'provider_attempts', attempts.length);
 
-  const prefix = exhausted
-    ? 'NIRA_PROVIDER_CAPACITY_EXHAUSTED'
-    : pressure
-      ? `NIRA_PROVIDER_PRESSURE_HTTP_${last.status || 0}`
-      : 'NIRA_PROVIDER_ROUTER_FAILED';
+  const prefix = exhausted ? 'NIRA_PROVIDER_CAPACITY_EXHAUSTED' : pressure ? `NIRA_PROVIDER_PRESSURE_HTTP_${last.status || 0}` : 'NIRA_PROVIDER_ROUTER_FAILED';
   const error = new Error(`${prefix}: ${attempts.map(item => `${item.provider}:${item.status || 'error'}`).join(',')}`);
   error.niraProviderMeta = { pressure, exhausted, status: last.status || 0, retryAfter, attempts };
   throw error;
