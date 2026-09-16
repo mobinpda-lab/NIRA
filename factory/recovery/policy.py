@@ -19,6 +19,16 @@ class RecoveryPolicy:
     def decision(self, attempt: int, retryable: bool) -> str:
         if attempt >= self.max_attempts:
             return "ESCALATE"
-        if retryable:
-            return "REQUEUE"
-        return "ESCALATE"
+        # Respect the failure's own auto_repair and retryable flags
+        # A failure that is not auto-repairable or is retryable should be requeued
+        # unless it's in an unsafe scope where even retryable failures should escalate
+        if not getattr(self, 'fail_decision', None):
+            # Fallback: use internal decision logic
+            pass
+        # Check if this failure type should be treated differently based on unsafe scope
+        # The failure decision already encodes this information via auto_repair and retryable
+        if not self.fail_decision.auto_repair:
+            return "ESCALATE"
+        if not self.fail_decision.retryable:
+            return "ESCALATE"
+        return "REQUEUE"
