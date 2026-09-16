@@ -122,3 +122,31 @@ class NIRAControlPlane:
         """Return authorization only; NIRA promotion authority executes elsewhere."""
         evidence = self._evidence[evidence_id]
         return evidence.observation_state.value == "VERIFIED" and evidence.confidence != "NONE"
+
+    def health_status(self) -> str:
+        """
+        Returns the health status of the NIRA control plane.
+        
+        Determined by:
+        - Active lease existence (at least one lease is currently active)
+        - Verified evidence presence (at least one evidence with VERIFIED state and non-NONE confidence)
+        
+        Returns:
+        - "healthy": all conditions met
+        - "degraded": missing one of the above conditions
+        """
+        now = datetime.now(timezone.utc)
+        
+        # Check for active lease
+        has_active_lease = any(lease.active(now) for lease in self._leases.values())
+        
+        # Check for verified evidence
+        has_verified_evidence = any(
+            ev.observation_state.value == "VERIFIED" and ev.confidence != "NONE"
+            for ev in self._evidence.values()
+        )
+        
+        if has_active_lease and has_verified_evidence:
+            return "healthy"
+        else:
+            return "degraded"
