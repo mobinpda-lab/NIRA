@@ -70,6 +70,7 @@ def classify_failure(text: str, *, changed_files: tuple[str, ...] = (), repeated
             matched = category
             break
 
+    # Determine if this failure falls under an unsafe scope (e.g., involves secrets, credentials, or protected control surfaces)
     unsafe_scope = any(
         p.startswith(".github/workflows/")
         or p == "factory/registry/promotion-policy.json"
@@ -84,9 +85,16 @@ def classify_failure(text: str, *, changed_files: tuple[str, ...] = (), repeated
     if matched is FailureClass.ENVIRONMENT:
         return FailureDecision(matched, "MEDIUM", False, "ENVIRONMENT_RECOVERY", True, "environment failures should not spend AI repair budget")
     if matched is FailureClass.DEPENDENCY:
-        return FailureDecision(matched, "MEDIUM", not unsafe_scope, "BOUNDED_REPAIR" if not unsafe_scope else "ESCALATE", True, "dependency repair allowed only outside protected control surfaces")
+        # Dependency failures can be repaired outside protected surfaces, but not inside them
+        repair_allowed = not unsafe_scope
+        owner_lane = "BOUNDED_REPAIR" if repair_allowed else "ESCALATE"
+        return FailureDecision(matched, "MEDIUM", repair_allowed, owner_lane, True, "dependency repair allowed only outside protected control surfaces")
     if matched in {FailureClass.CODE, FailureClass.TEST_REGRESSION}:
-        return FailureDecision(matched, "MEDIUM", not unsafe_scope, "BOUNDED_REPAIR" if not unsafe_scope else "ESCALATE", True, "source/test failures may enter bounded repair")
+        # Code and test regression failures can be repaired outside protected surfaces
+        repair_allowed = not unsafe_scope
+        owner_lane = "BOUNDED_REPAIR" if repair_allowed else "ESCALATE"
+        return FailureDecision(matched, "MEDIUM", repair_allowed, owner_lane, True, "source/test failures may enter bounded repair")
     if matched is FailureClass.FLAKY:
+        # Flaky failures should be revalidated before considering code repair
         return FailureDecision(matched, "LOW" if not repeated else "MEDIUM", False, "REVALIDATE", True, "flaky evidence should be revalidated before code repair")
     return FailureDecision(FailureClass.UNKNOWN, "NONE", False, "ESCALATE", False, "unknown failure fails closed")
