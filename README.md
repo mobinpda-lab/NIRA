@@ -54,3 +54,7 @@ NIRA has the architectural boundary, production orchestrator bootstrap, canonica
 The complete historical naming transition is recorded in `docs/history/NIRA_IDENTITY_HISTORY.md`. Historical identifiers are provenance only and are never active factory authority.
 
 See `docs/architecture/NIRA_FACTORY_CONTROL_PLANE_v1.md` and `docs/architecture/NIRA_INDEPENDENT_FACTORY_ARCHITECTURE.md` for the canonical boundary and implementation contract.
+
+## Intelligence pipeline proof
+
+NIRA self-maintenance uses deterministic failure classification, adaptive queue capacity, exact-head change-impact planning, independent CI/security evidence, GitHub-derived operating state, specialized worker-role contracts, and fail-closed promotion. Exhausted AI provider capacity blocks only the AI lane; deterministic factory work remains available.
